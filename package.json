@@ -37,9 +37,9 @@
     "url": "https://github.com/miaoge/AIStudioToAPI.git"
   },
   "bugs": {
-    "url": "https://github.com/miaoge/AIStudioToAPI/issues"
+    "url": "https://github.com/miaoge2026/AIStudioToAPI/issues"
   },
-  "homepage": "https://github.com/miaoge/AIStudioToAPI#readme",
+  "homepage": "https://github.com/miaoge2026/AIStudioToAPI#readme",
   "engines": {
     "node": ">=18.0.0"
   },

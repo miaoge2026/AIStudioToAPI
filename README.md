@@ -4,6 +4,8 @@
 
 一个强大的代理工具，将 Google AI Studio (Gemini) 封装为兼容 OpenAI API、Claude API 和原生 Gemini API 格式的接口。支持多账户轮转、智能错误处理、流式响应和自动恢复机制。
 
+**GitHub 仓库**: https://github.com/miaoge2026/AIStudioToAPI
+
 ## ✨ 核心特性
 
 - **多协议支持**：无缝兼容 OpenAI API、Claude API、Gemini API 和 OpenAI Response API

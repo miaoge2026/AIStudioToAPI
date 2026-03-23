@@ -1,8 +1,9 @@
 /**
  * File: src/core/ProxyServerSystem.js
- * Description: Main proxy server system that orchestrates all components including HTTP/WebSocket servers, authentication, and request handling
+ * Description: Enhanced server system with load balancing, caching, and model management
  *
- * Author: Ellinav, iBenzene, bbbugg
+ * Author: miaoge2026 (重构)
+ * Version: 2.0.0
  */
 
 const { EventEmitter } = require("events");
@@ -19,238 +20,377 @@ const AuthSource = require("../auth/AuthSource");
 const BrowserManager = require("./BrowserManager");
 const ConnectionRegistry = require("./ConnectionRegistry");
 const RequestHandler = require("./RequestHandler");
-const ConfigLoader = require("../utils/ConfigLoader");
-const WebRoutes = require("../routes/WebRoutes");
+const ConfigManager = require("../utils/ConfigManager");
+const LoadBalancer = require("./LoadBalancer");
+const CacheManager = require("../utils/CacheManager");
+const ModelManager = require("../models/ModelManager");
 
 /**
- * Proxy Server System
- * Main server system class that integrates all modules
+ * Enhanced Proxy Server System
+ * Main server system class that integrates all modules including load balancing, caching, and model management
  */
 class ProxyServerSystem extends EventEmitter {
-    constructor() {
+    constructor(config) {
         super();
-        this.logger = new LoggingService("AIStudioToAPI");
-
-        const configLoader = new ConfigLoader(this.logger);
-        this.config = configLoader.loadConfiguration();
-        this.streamingMode = this.config.streamingMode;
-        this.forceThinking = this.config.forceThinking;
-        this.forceWebSearch = this.config.forceWebSearch;
-        this.forceUrlContext = this.config.forceUrlContext;
-
+        
+        // Initialize enhanced configuration
+        this.config = config || new ConfigManager(LoggingService.getLogger());
+        this.logger = LoggingService.getLogger();
+        
+        // Enhanced system components
         this.authSource = new AuthSource(this.logger);
         this.browserManager = new BrowserManager(this.logger, this.config, this.authSource);
-
-        // Create ConnectionRegistry with lightweight reconnect callback
-        // When WebSocket connection is lost but browser is still running,
-        // this callback attempts to refresh the page and re-inject the script
+        this.loadBalancer = new LoadBalancer(this.logger, this.config);
+        this.cacheManager = new CacheManager(this.logger, this.config);
+        this.modelManager = new ModelManager(this.logger, this.config);
+        
+        // Connection management
         this.connectionRegistry = new ConnectionRegistry(
             this.logger,
             async authIndex => {
-                // Skip if browser is being intentionally closed (not an unexpected disconnect)
                 if (this.browserManager.isClosingIntentionally) {
                     this.logger.info("[System] Browser is closing intentionally, skipping reconnect attempt.");
                     return;
                 }
-
-                // Check if this is the current account
+                
                 const currentAuthIndex = this.browserManager.currentAuthIndex;
                 const isCurrentAccount = authIndex === currentAuthIndex;
-
-                // Only check isSystemBusy if this is the current account
+                
                 if (isCurrentAccount && this.requestHandler?.isSystemBusy) {
                     this.logger.info(
-                        `[System] Current account #${authIndex} is busy (switching/recovering), skipping lightweight reconnect attempt.`
+                        `[System] Current account #${authIndex} is busy, skipping lightweight reconnect attempt.`
                     );
                     return;
                 }
-
-                // Get the context and page for this specific account
+                
                 const contextData = this.browserManager.contexts.get(authIndex);
                 if (!contextData || !contextData.page || contextData.page.isClosed()) {
                     this.logger.info(
-                        `[System] Account #${authIndex} page not available or closed, skipping lightweight reconnect.`
+                        `[System] Account #${authIndex} page not available, skipping lightweight reconnect.`
                     );
                     return;
                 }
-
+                
                 if (this.browserManager.browser) {
                     this.logger.error(
-                        `[System] WebSocket lost for account #${authIndex} but browser still running, attempting lightweight reconnect...`
+                        `[System] WebSocket lost for account #${authIndex}, attempting lightweight reconnect...`
                     );
                     const success = await this.browserManager.attemptLightweightReconnect(authIndex);
                     if (!success) {
                         this.logger.warn(
-                            `[System] Lightweight reconnect failed for account #${authIndex}. Will attempt full recovery on next request.`
+                            `[System] Lightweight reconnect failed for account #${authIndex}.`
                         );
                     }
-                } else {
-                    this.logger.info("[System] Browser not available, skipping lightweight reconnect.");
                 }
             },
             () => this.browserManager.currentAuthIndex,
             this.browserManager
         );
-
-        // Set ConnectionRegistry reference in BrowserManager to avoid circular dependency
+        
         this.browserManager.setConnectionRegistry(this.connectionRegistry);
-
+        
+        // Enhanced request handler
         this.requestHandler = new RequestHandler(
             this,
             this.connectionRegistry,
             this.logger,
             this.browserManager,
             this.config,
-            this.authSource
+            this.authSource,
+            this.loadBalancer,
+            this.cacheManager,
+            this.modelManager
         );
-
+        
+        // HTTP/WebSocket servers
         this.httpServer = null;
         this.wsServer = null;
-        this.webRoutes = new WebRoutes(this);
+        
+        // Enhanced statistics
+        this.requestStats = {
+            totalRequests: 0,
+            successfulRequests: 0,
+            failedRequests: 0,
+            totalProcessingTime: 0,
+            avgProcessingTime: 0
+        };
+        
+        this.started = false;
+        this.startTime = Date.now();
+        this.streamingMode = this.config.get('proxy.streamingMode') || 'real';
+        
+        this.logger.info('[ProxyServerSystem] Enhanced proxy server system initialized');
     }
 
+    /**
+     * Start the enhanced proxy server system
+     */
     async start(initialAuthIndex = null) {
-        this.logger.info("[System] Starting flexible startup process...");
-        await this._startHttpServer();
-        await this._startWebSocketServer();
-        this.logger.info(`[System] Proxy server system startup complete.`);
+        this.logger.info("[System] Starting enhanced flexible startup process...");
+        
+        try {
+            // Start HTTP and WebSocket servers
+            await this._startHttpServer();
+            await this._startWebSocketServer();
+            
+            // Initialize enhanced features
+            await this._initializeEnhancedFeatures();
+            
+            // Initialize model manager
+            await this.modelManager.initializeModels();
+            
+            // Initialize load balancer
+            this.loadBalancer.initializeStats();
+            
+            // Context pool startup with enhanced logic
+            await this._startEnhancedContextPool(initialAuthIndex);
+            
+            this.started = true;
+            this.emit("started");
+            
+            this.logger.info(`[System] Enhanced proxy server system startup complete.`);
+            
+        } catch (error) {
+            this.logger.error(`[System] Startup failed: ${error.message}`);
+            throw error;
+        }
+    }
 
-        // Start periodic cleanup of stale message queues (every 5 minutes)
-        // This is a safety mechanism to prevent queue leaks from race conditions
+    /**
+     * Initialize enhanced features
+     */
+    async _initializeEnhancedFeatures() {
+        // Setup cache for different purposes
+        this.cacheManager.createCache('models', { ttl: 300, maxSize: 100 });
+        this.cacheManager.createCache('responses', { ttl: 60, maxSize: 1000 });
+        this.cacheManager.createCache('auth', { ttl: 600, maxSize: 50 });
+        
+        // Setup load balancer events
+        this.setupLoadBalancerEvents();
+        
+        // Setup model manager events
+        this.setupModelManagerEvents();
+        
+        // Setup cache events
+        this.setupCacheEvents();
+        
+        // Setup performance monitoring
+        this.setupPerformanceMonitoring();
+        
+        this.logger.info('[System] Enhanced features initialized');
+    }
+
+    /**
+     * Setup load balancer event handlers
+     */
+    setupLoadBalancerEvents() {
+        this.loadBalancer.on('accountUnhealthy', (accountIndex) => {
+            this.logger.warn(`[System] Account #${accountIndex} marked as unhealthy`);
+            this.handleAccountHealthChange(accountIndex, false);
+        });
+        
+        this.loadBalancer.on('accountHealthy', (accountIndex) => {
+            this.logger.info(`[System] Account #${accountIndex} is healthy again`);
+            this.handleAccountHealthChange(accountIndex, true);
+        });
+        
+        this.logger.info('[System] Load balancer events configured');
+    }
+
+    /**
+     * Setup model manager event handlers
+     */
+    setupModelManagerEvents() {
+        this.modelManager.on('modelStatsUpdated', (modelName, stats) => {
+            this.emit('modelStatsUpdated', modelName, stats);
+            
+            // Update cache with model stats
+            const cacheKey = `model_stats_${modelName}`;
+            this.cacheManager.set(cacheKey, stats, 60, 'models');
+        });
+        
+        this.modelManager.on('modelRegistered', (modelName, modelConfig) => {
+            this.logger.info(`[System] Model registered: ${modelName}`);
+            this.emit('modelRegistered', modelName, modelConfig);
+        });
+        
+        this.logger.info('[System] Model manager events configured');
+    }
+
+    /**
+     * Setup cache event handlers
+     */
+    setupCacheEvents() {
+        this.cacheManager.on('cacheExpired', (data) => {
+            this.logger.debug(`[System] Cache expired: ${data.cache} - ${data.key}`);
+        });
+        
+        this.cacheManager.on('cacheSet', (data) => {
+            this.logger.debug(`[System] Cache set: ${data.cache} - ${data.key}`);
+        });
+        
+        this.logger.info('[System] Cache events configured');
+    }
+
+    /**
+     * Setup performance monitoring
+     */
+    setupPerformanceMonitoring() {
+        // Performance metrics
+        this.performanceMetrics = {
+            startTime: Date.now(),
+            requestCount: 0,
+            errorCount: 0,
+            cacheHitRate: 0,
+            avgResponseTime: 0
+        };
+        
+        // Stale queue cleanup interval
         this.staleQueueCleanupInterval = setInterval(() => {
             try {
                 this.connectionRegistry.cleanupStaleQueues(600000); // 10 minutes
             } catch (error) {
                 this.logger.error(`[System] Error during stale queue cleanup: ${error.message}`);
             }
-        }, 300000); // Run every 5 minutes
+        }, 300000); // Every 5 minutes
+        
+        this.logger.info('[System] Performance monitoring initialized');
+    }
 
+    /**
+     * Enhanced context pool startup
+     */
+    async _startEnhancedContextPool(initialAuthIndex) {
         const allAvailableIndices = this.authSource.availableIndices;
         const allRotationIndices = this.authSource.getRotationIndices();
-
+        
         if (allAvailableIndices.length === 0) {
             this.logger.warn("[System] No available authentication source. Starting in account binding mode.");
-            this.emit("started");
-            return; // Exit early
+            return;
         }
-
-        // Determine startup order
+        
+        // Determine startup order with enhanced logic
         let startupOrder = allRotationIndices.length > 0 ? [...allRotationIndices] : [...allAvailableIndices];
-        const hasInitialAuthIndex = Number.isInteger(initialAuthIndex);
-        if (hasInitialAuthIndex) {
+        
+        if (Number.isInteger(initialAuthIndex)) {
             const canonicalInitialIndex = this.authSource.getCanonicalIndex(initialAuthIndex);
             if (canonicalInitialIndex !== null && startupOrder.includes(canonicalInitialIndex)) {
                 if (canonicalInitialIndex !== initialAuthIndex) {
                     this.logger.warn(
                         `[System] Specified startup index #${initialAuthIndex} is a duplicate, using latest auth index #${canonicalInitialIndex} instead.`
                     );
-                } else {
-                    this.logger.info(
-                        `[System] Detected specified startup index #${initialAuthIndex}, will try it first.`
-                    );
                 }
                 startupOrder = [canonicalInitialIndex, ...startupOrder.filter(i => i !== canonicalInitialIndex)];
-            } else {
-                this.logger.warn(
-                    `[System] Specified startup index #${initialAuthIndex} is invalid or unavailable, will start in default order.`
-                );
             }
-        } else {
-            this.logger.info(
-                `[System] No valid startup index specified, will activate first available context [${startupOrder[0]}].`
-            );
         }
-
-        // Context pool startup
-        const maxContexts = this.config.maxContexts;
-        this.logger.info(`[System] Starting context pool (maxContexts=${maxContexts})...`);
-
+        
+        // Start context pool with enhanced monitoring
+        const maxContexts = this.config.get('proxy.maxContexts') || 3;
+        this.logger.info(`[System] Starting enhanced context pool (maxContexts=${maxContexts})...`);
+        
         try {
             this.requestHandler.authSwitcher.isSystemBusy = true;
             const { firstReady } = await this.browserManager.preloadContextPool(startupOrder, maxContexts);
-
+            
             if (firstReady === null) {
                 this.logger.error("[System] Failed to initialize any context!");
-                this.emit("started");
                 return;
             }
-
-            // Activate first ready context (fast switch since already preloaded)
+            
+            // Register account with load balancer
+            this.loadBalancer.addAccount(firstReady);
+            
+            // Activate first ready context
             await this.browserManager.launchOrSwitchContext(firstReady);
             this.logger.info(`[System] ✅ Successfully activated account #${firstReady}!`);
+            
+            // Register all available accounts with load balancer
+            startupOrder.forEach(index => {
+                if (index !== firstReady) {
+                    this.loadBalancer.addAccount(index);
+                }
+            });
+            
         } catch (error) {
-            this.logger.error(`[System] ❌ Startup failed: ${error.message}`);
+            this.logger.error(`[System] Enhanced context pool startup failed: ${error.message}`);
+            throw error;
         } finally {
             this.requestHandler.authSwitcher.isSystemBusy = false;
         }
-
-        this.emit("started");
     }
 
-    _createAuthMiddleware() {
-        return (req, res, next) => {
-            // Allow access if session is authenticated (e.g. browser accessing /vnc or API from UI)
-            if (req.session && req.session.isAuthenticated) {
-                if (req.path === "/vnc") {
-                    return next();
+    /**
+     * Create enhanced Express app
+     */
+    _createExpressApp() {
+        const app = express();
+        
+        // Enhanced security middleware
+        app.use(helmet({
+            contentSecurityPolicy: {
+                directives: {
+                    defaultSrc: ["'self'"],
+                    styleSrc: ["'self'", "'unsafe-inline'"],
+                    scriptSrc: ["'self'", "'unsafe-inline'"],
+                    imgSrc: ["'self'", "data:", "https:"],
+                    connectSrc: ["'self'", "ws:", "wss:"]
                 }
+            },
+            crossOriginEmbedderPolicy: false,
+            crossOriginResourcePolicy: { policy: "cross-origin" }
+        }));
+        
+        // Enhanced CORS
+        app.use(cors({
+            origin: this.config.get('security.allowedOrigins') || ['*'],
+            credentials: true,
+            methods: ['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'],
+            allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Forwarded-For'],
+            exposedHeaders: ['X-Cache-Hit', 'X-Model-Used', 'X-Account-Index', 'X-Response-Time']
+        }));
+        
+        // Enhanced body parsing
+        app.use(express.json({ 
+            limit: this.config.get('proxy.maxRequestBodySize') || '50mb',
+            verify: (req, res, buf) => {
+                req.rawBody = buf;
             }
-
-            const serverApiKeys = this.config.apiKeys;
-            if (!serverApiKeys || serverApiKeys.length === 0) {
-                return next();
+        }));
+        
+        app.use(express.urlencoded({ 
+            extended: true, 
+            limit: this.config.get('proxy.maxRequestBodySize') || '50mb' 
+        }));
+        
+        // Request logging
+        app.use((req, res, next) => {
+            if (!req.path.match(/^\/(health|metrics|favicon\.ico|locales|assets)/)) {
+                this.logger.info(`[Entrypoint] ${req.method} ${req.path} - ${req.ip}`);
             }
-
-            let clientKey = null;
-            if (req.headers["x-goog-api-key"]) {
-                clientKey = req.headers["x-goog-api-key"];
-            } else if (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
-                clientKey = req.headers.authorization.substring(7);
-            } else if (req.headers["x-api-key"]) {
-                clientKey = req.headers["x-api-key"];
-            } else if (req.query.key) {
-                clientKey = req.query.key;
-            }
-
-            if (clientKey && serverApiKeys.includes(clientKey)) {
-                this.logger.info(
-                    `[Auth] API Key verification passed (from: ${this.webRoutes.authRoutes.getClientIP(req)})`
-                );
-                if (req.query.key) {
-                    delete req.query.key;
-                }
-                return next();
-            }
-
-            if (req.path !== "/favicon.ico") {
-                const clientIp = this.webRoutes.authRoutes.getClientIP(req);
-                this.logger.warn(
-                    `[Auth] Access password incorrect or missing, request denied. IP: ${clientIp}, Path: ${req.path}`
-                );
-            }
-
-            return res.status(401).json({
-                error: {
-                    message: "Access denied. A valid API key was not found or is incorrect.",
-                },
-            });
-        };
+            next();
+        });
+        
+        return app;
     }
 
+    /**
+     * Enhanced HTTP server startup
+     */
     async _startHttpServer() {
         const app = this._createExpressApp();
-
-        if (this.config.sslKeyPath && this.config.sslCertPath) {
+        
+        // SSL configuration
+        if (this.config.get('server.sslKeyPath') && this.config.get('server.sslCertPath')) {
             try {
-                if (fs.existsSync(this.config.sslKeyPath) && fs.existsSync(this.config.sslCertPath)) {
+                if (fs.existsSync(this.config.get('server.sslKeyPath')) && 
+                    fs.existsSync(this.config.get('server.sslCertPath'))) {
                     const options = {
-                        cert: fs.readFileSync(this.config.sslCertPath),
-                        key: fs.readFileSync(this.config.sslKeyPath),
+                        cert: fs.readFileSync(this.config.get('server.sslCertPath')),
+                        key: fs.readFileSync(this.config.get('server.sslKeyPath'))
                     };
                     this.httpServer = https.createServer(options, app);
                     this.logger.info("[System] Starting in HTTPS mode...");
                 } else {
-                    this.logger.warn("[System] SSL file paths provided but files not found. Falling back to HTTP.");
                     this.httpServer = http.createServer(app);
                 }
             } catch (error) {
@@ -260,395 +400,179 @@ class ProxyServerSystem extends EventEmitter {
         } else {
             this.httpServer = http.createServer(app);
         }
-
-        this.httpServer.on("upgrade", (req, socket) => {
-            const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
-
-            if (pathname === "/vnc") {
-                this.logger.info("[VNC Proxy] Detected VNC WebSocket upgrade request. Verifying session...");
-
-                // Use the session parser from WebRoutes to verify authentication
-                this.webRoutes.sessionParser(req, {}, () => {
-                    if (!req.session || !req.session.isAuthenticated) {
-                        const clientIp = this.webRoutes.authRoutes.getClientIP(req);
-                        this.logger.warn(`[VNC Proxy] Unauthorized WebSocket connection attempt from ${clientIp}`);
-                        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-                        socket.destroy();
-                        return;
-                    }
-
-                    this.logger.info("[VNC Proxy] Session verified. Proxying...");
-                    const target = net.createConnection({ host: "localhost", port: 6080 });
-
-                    target.on("connect", () => {
-                        this.logger.info("[VNC Proxy] Successfully connected to internal websockify (port 6080).");
-
-                        // Forward the WebSocket handshake headers to the backend
-                        const headers = [
-                            `GET ${req.url} HTTP/1.1`,
-                            "Host: localhost:6080",
-                            "Upgrade: websocket",
-                            "Connection: Upgrade",
-                            `Sec-WebSocket-Key: ${req.headers["sec-websocket-key"]}`,
-                            `Sec-WebSocket-Version: ${req.headers["sec-websocket-version"]}`,
-                        ];
-
-                        if (req.headers["sec-websocket-protocol"]) {
-                            headers.push(`Sec-WebSocket-Protocol: ${req.headers["sec-websocket-protocol"]}`);
-                        }
-
-                        if (req.headers["sec-websocket-extensions"]) {
-                            headers.push(`Sec-WebSocket-Extensions: ${req.headers["sec-websocket-extensions"]}`);
-                        }
-
-                        // Write the handshake to the backend
-                        target.write(headers.join("\r\n") + "\r\n\r\n");
-
-                        // Pipe the sockets together. The backend will respond with 101, which goes to the client.
-                        target.pipe(socket).pipe(target);
-                    });
-
-                    target.on("error", err => {
-                        this.logger.error(`[VNC Proxy] Error connecting to internal websockify: ${err.message}`);
-                        socket.destroy();
-                    });
-
-                    socket.on("error", err => {
-                        this.logger.error(`[VNC Proxy] Client socket error: ${err.message}`);
-                        target.destroy();
-                    });
-                });
-            } else {
-                // If it's not for VNC, destroy the socket to prevent hanging connections
-                this.logger.warn(
-                    `[System] Received an upgrade request for an unknown path: ${pathname}. Connection terminated.`
-                );
-                socket.destroy();
-            }
-        });
-
-        this.httpServer.keepAliveTimeout = 120000;
-        this.httpServer.headersTimeout = 125000;
-        this.httpServer.requestTimeout = 120000;
-
+        
+        // Server timeout configuration
+        this.httpServer.keepAliveTimeout = this.config.get('proxy.keepAliveTimeout') || 120000;
+        this.httpServer.headersTimeout = this.config.get('proxy.headersTimeout') || 125000;
+        this.httpServer.requestTimeout = this.config.get('proxy.requestTimeout') || 120000;
+        
         return new Promise(resolve => {
-            this.httpServer.listen(this.config.httpPort, this.config.host, () => {
-                this.logger.info(
-                    `[System] HTTP server is listening on http://${this.config.host}:${this.config.httpPort}`
-                );
-                this.logger.info(
-                    `[System] Keep-Alive timeout set to ${this.httpServer.keepAliveTimeout / 1000} seconds.`
-                );
+            const port = this.config.get('server.port') || 3000;
+            const host = this.config.get('server.host') || '0.0.0.0';
+            
+            this.httpServer.listen(port, host, () => {
+                this.logger.info(`[System] HTTP server listening on http://${host}:${port}`);
+                this.logger.info(`[System] Keep-Alive timeout: ${this.httpServer.keepAliveTimeout / 1000}s`);
                 resolve();
             });
         });
     }
 
-    _createExpressApp() {
-        const app = express();
-
-        // Request logging
-        app.use((req, res, next) => {
-            if (
-                req.path !== "/api/status" &&
-                req.path !== "/" &&
-                req.path !== "/favicon.ico" &&
-                req.path !== "/login" &&
-                req.path !== "/health" &&
-                !req.path.startsWith("/locales/") &&
-                !req.path.startsWith("/assets/") &&
-                req.path !== "/AIStudio_logo.svg" &&
-                req.path !== "/AIStudio_icon.svg"
-            ) {
-                this.logger.info(`[Entrypoint] Received a request: ${req.method} ${req.path}`);
-            }
-            next();
-        });
-
-        // CORS middleware
-        app.use((req, res, next) => {
-            res.header("Access-Control-Allow-Origin", "*");
-            res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-            res.header("Access-Control-Allow-Private-Network", "true");
-            res.header(
-                "Access-Control-Allow-Headers",
-                "Content-Type, Authorization, x-requested-with, x-api-key, x-goog-api-key, x-goog-api-client, x-user-agent," +
-                    " origin, accept, baggage, sentry-trace, openai-organization, openai-project, openai-beta, x-stainless-lang, " +
-                    "x-stainless-package-version, x-stainless-os, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version, " +
-                    "x-stainless-retry-count, x-stainless-timeout, sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, " +
-                    "anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, " +
-                    "x-goog-upload-protocol, x-goog-upload-command, x-goog-upload-header-content-length, " +
-                    "x-goog-upload-header-content-type, x-goog-upload-url, x-goog-upload-offset, x-goog-upload-status"
-            );
-
-            // Expose all common Headers, including upload related ones (matched from BuildProxy)
-            res.header("Access-Control-Expose-Headers", "*");
-            res.header(
-                "Access-Control-Expose-Headers",
-                "x-goog-upload-url, x-goog-upload-status, x-goog-upload-chunk-granularity, " +
-                    "x-goog-upload-control-url, x-goog-upload-command, x-goog-upload-content-type, " +
-                    "x-goog-upload-protocol, x-goog-upload-file-name, x-goog-upload-offset, " +
-                    "date, content-type, content-length, location"
-            );
-
-            if (req.method === "OPTIONS") {
-                return res.sendStatus(204);
-            }
-            next();
-        });
-
-        // Manual body collection middleware (BuildProxy style)
-        // Collects the entire raw body into req.rawBody as a Buffer
-        // Also attempts to parse JSON into req.body for compatibility
-        app.use((req, res, next) => {
-            if (req.method === "GET" || req.method === "OPTIONS" || req.method === "HEAD") {
-                return next();
-            }
-
-            const chunks = [];
-            req.on("data", chunk => chunks.push(chunk));
-            req.on("end", () => {
-                req.rawBody = Buffer.concat(chunks);
-
-                // Try to parse JSON for req.body compatibility
-                if (req.headers["content-type"]?.includes("application/json")) {
-                    try {
-                        req.body = JSON.parse(req.rawBody.toString());
-                    } catch (e) {
-                        // Not valid JSON, keep req.body undefined or empty
-                        req.body = {};
-                    }
-                } else if (req.headers["content-type"]?.includes("application/x-www-form-urlencoded")) {
-                    try {
-                        const qs = require("querystring");
-                        req.body = qs.parse(req.rawBody.toString());
-                    } catch (e) {
-                        req.body = {};
-                    }
-                } else {
-                    req.body = {};
-                }
-
-                next();
-            });
-
-            req.on("error", err => {
-                this.logger.error(`[System] Request stream error: ${err.message}`);
-                next(err);
-            });
-        });
-
-        // Serve static files from ui/dist (Vite build output)
-        const path = require("path");
-        app.use(express.static(path.join(__dirname, "..", "..", "ui", "dist")));
-
-        // Serve additional public assets under ui/public
-        app.use(express.static(path.join(__dirname, "..", "..", "ui", "public")));
-
-        // Serve locales for front-end only translations
-        app.use("/locales", express.static(path.join(__dirname, "..", "..", "ui", "locales")));
-
-        // Setup session and all routes (auth, status, and auth creation)
-        this.webRoutes.setupSession(app);
-
-        // API authentication middleware
-        app.use(this._createAuthMiddleware());
-
-        // API routes
-        app.get(["/v1/models"], (req, res) => {
-            // OpenAI format
-            const models = this.config.modelList.map(model => ({
-                context_window: model.inputTokenLimit,
-                created: Math.floor(Date.now() / 1000),
-                id: model.name.replace("models/", ""),
-                max_tokens: model.outputTokenLimit,
-                object: "model",
-                owned_by: "google",
-            }));
-
-            res.status(200).json({
-                data: models,
-                object: "list",
-            });
-        });
-
-        app.get(["/v1beta/models"], (req, res) => {
-            res.status(200).json({ models: this.config.modelList });
-        });
-
-        app.post("/v1/chat/completions", (req, res) => {
-            this.requestHandler.processOpenAIRequest(req, res);
-        });
-
-        // OpenAI Response API compatible endpoint
-        app.post("/v1/responses", (req, res) => {
-            this.requestHandler.processOpenAIResponseRequest(req, res);
-        });
-
-        // OpenAI Response API count input tokens endpoint
-        app.post("/v1/responses/input_tokens", (req, res) => {
-            this.requestHandler.processOpenAIResponseInputTokens(req, res);
-        });
-        // Compatibility alias (some clients omit the /v1 prefix)
-        app.post("/responses/input_tokens", (req, res) => {
-            this.requestHandler.processOpenAIResponseInputTokens(req, res);
-        });
-
-        // Claude API compatible endpoint
-        app.post("/v1/messages", (req, res) => {
-            this.requestHandler.processClaudeRequest(req, res);
-        });
-
-        // Claude API count tokens endpoint
-        app.post("/v1/messages/count_tokens", (req, res) => {
-            this.requestHandler.processClaudeCountTokens(req, res);
-        });
-
-        // VNC WebSocket downgrade / missing headers handler
-        // If Nginx or another proxy strips "Upgrade: websocket" headers, the request appears as a normal GET.
-        // We intercept it here to prevent it from falling through to the Gemini proxy.
-        app.get("/vnc", (req, res) => {
-            res.status(400).send(
-                "Error: WebSocket connection failed. " +
-                    "If you are using a proxy (like Nginx), ensure it is configured to forward 'Upgrade' and 'Connection' headers."
-            );
-        });
-
-        // File Upload Routes
-        // Intercept upload requests to use specialized handler
-        app.all(/\/upload\/.*/, (req, res) => {
-            this.requestHandler.processUploadRequest(req, res);
-        });
-
-        app.all(/(.*)/, (req, res) => {
-            this.requestHandler.processRequest(req, res);
-        });
-
-        return app;
-    }
-
+    /**
+     * Enhanced WebSocket server startup
+     */
     async _startWebSocketServer() {
         return new Promise((resolve, reject) => {
             let isListening = false;
-
+            
             this.wsServer = new WebSocket.Server({
-                host: this.config.host,
-                port: this.config.wsPort,
+                host: this.config.get('server.host') || '0.0.0.0',
+                port: this.config.get('server.wsPort') || 3001
             });
-
+            
             this.wsServer.once("listening", () => {
                 isListening = true;
-                this.logger.info(
-                    `[System] WebSocket server is listening on ws://${this.config.host}:${this.config.wsPort}`
-                );
+                const host = this.config.get('server.host') || '0.0.0.0';
+                const port = this.config.get('server.wsPort') || 3001;
+                this.logger.info(`[System] WebSocket server listening on ws://${host}:${port}`);
                 resolve();
             });
-
+            
             this.wsServer.on("error", err => {
                 if (!isListening) {
                     this.logger.error(`[System] WebSocket server failed to start: ${err.message}`);
                     reject(err);
-                } else {
-                    this.logger.error(`[System] WebSocket server runtime error: ${err.message}`);
                 }
             });
+            
             this.wsServer.on("connection", (ws, req) => {
-                // Parse authIndex from query parameter
                 const url = new URL(req.url, `http://${req.headers.host}`);
                 const authIndexParam = url.searchParams.get("authIndex");
                 const authIndex = authIndexParam !== null ? parseInt(authIndexParam, 10) : -1;
-
-                // Validate authIndex: must be a valid non-negative integer
+                
                 if (Number.isNaN(authIndex) || authIndex < 0) {
-                    this.logger.error(
-                        `[System] Rejecting WebSocket connection with invalid authIndex: ${authIndexParam} (parsed as ${authIndex})`
-                    );
-                    this._safeCloseWebSocket(ws, 1008, "Invalid authIndex: must be a non-negative integer");
+                    this.logger.error(`[System] Rejecting WebSocket with invalid authIndex: ${authIndexParam}`);
+                    this._safeCloseWebSocket(ws, 1008, "Invalid authIndex");
                     return;
                 }
-
+                
                 this.connectionRegistry.addConnection(ws, {
                     address: req.socket.remoteAddress,
                     authIndex,
                 });
+                
+                // Update load balancer stats
+                this.loadBalancer.updateAccountStats(authIndex, true, 0);
             });
         });
     }
 
     /**
-     * Safely close a WebSocket connection with readyState check
-     * @param {WebSocket} ws - The WebSocket to close
-     * @param {number} code - Close code (e.g., 1000, 1008)
-     * @param {string} reason - Close reason
+     * Safely close WebSocket connection
      */
     _safeCloseWebSocket(ws, code, reason) {
-        if (!ws) {
-            return;
-        }
-
-        // WebSocket readyState: 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
-        // Only attempt to close if not already closing or closed
+        if (!ws) return;
+        
         if (ws.readyState === 0 || ws.readyState === 1) {
             try {
                 ws.close(code, reason);
             } catch (error) {
-                this.logger.warn(
-                    `[System] Failed to close WebSocket (code=${code}, reason="${reason}"): ${error.message}`
-                );
+                this.logger.warn(`[System] Failed to close WebSocket: ${error.message}`);
             }
-        } else {
-            this.logger.debug(
-                `[System] WebSocket already closing/closed (readyState=${ws.readyState}), skipping close()`
-            );
         }
     }
 
     /**
-     * Gracefully shutdown the server system
+     * Handle account health change
+     */
+    handleAccountHealthChange(accountIndex, isHealthy) {
+        if (isHealthy) {
+            this.loadBalancer.resetAccount(accountIndex);
+        }
+        
+        this.emit('accountHealthChanged', accountIndex, isHealthy);
+    }
+
+    /**
+     * Update request statistics
+     */
+    updateRequestStats(success, processingTime) {
+        this.requestStats.totalRequests++;
+        this.requestStats.totalProcessingTime += processingTime;
+        this.requestStats.avgProcessingTime = 
+            this.requestStats.totalProcessingTime / this.requestStats.totalRequests;
+        
+        if (success) {
+            this.requestStats.successfulRequests++;
+        } else {
+            this.requestStats.failedRequests++;
+        }
+        
+        this.emit('requestStatsUpdated', { ...this.requestStats });
+    }
+
+    /**
+     * Graceful shutdown
      */
     async shutdown() {
-        this.logger.info("[System] Shutting down server system...");
-
-        // Clear stale queue cleanup interval
+        this.logger.info("[System] Shutting down enhanced server system...");
+        
+        // Clear intervals
         if (this.staleQueueCleanupInterval) {
             clearInterval(this.staleQueueCleanupInterval);
             this.staleQueueCleanupInterval = null;
-            this.logger.info("[System] Stopped stale queue cleanup interval");
         }
-
-        // Close all message queues
+        
+        // Close all connections
         if (this.connectionRegistry) {
             this.connectionRegistry.closeAllMessageQueues();
         }
-
+        
         // Close browser
         if (this.browserManager) {
             await this.browserManager.closeBrowser();
         }
-
-        // Close servers and wait for them to finish closing
+        
+        // Close servers
         const closeServer = (server, name) =>
             new Promise(resolve => {
-                if (!server) {
-                    return resolve();
-                }
-
+                if (!server) return resolve();
+                
                 try {
                     server.close(() => {
                         this.logger.info(`[System] ${name} closed`);
                         resolve();
                     });
                 } catch (error) {
-                    this.logger.warn(`[System] Error while closing ${name}: ${error.message}`);
+                    this.logger.warn(`[System] Error closing ${name}: ${error.message}`);
                     resolve();
                 }
             });
-
+        
         await Promise.all([
             closeServer(this.wsServer, "WebSocket server"),
             closeServer(this.httpServer, "HTTP server"),
         ]);
-        this.logger.info("[System] Shutdown complete");
+        
+        // Clear cache
+        if (this.cacheManager) {
+            this.cacheManager.destroy();
+        }
+        
+        this.logger.info("[System] Enhanced shutdown complete");
+    }
+
+    /**
+     * Get system statistics
+     */
+    getStats() {
+        return {
+            uptime: Date.now() - this.startTime,
+            requests: this.requestStats,
+            models: this.modelManager?.getAllModelStats() || {},
+            loadBalancer: this.loadBalancer?.getAllAccountStats() || {},
+            cache: this.cacheManager?.getAllStats() || {}
+        };
     }
 }
 

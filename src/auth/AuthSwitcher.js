@@ -2,22 +2,29 @@
  * File: src/auth/AuthSwitcher.js
  * Description: Authentication switcher that handles account rotation logic, failure tracking, and usage-based switching
  *
- * Author: Ellinav, iBenzene, bbbugg
+ * Author: Ellinav, iBenzene, bbbugg (Enhanced by miaoge2026)
  */
 
 /**
- * Authentication Switcher Module
+ * Authentication Switcher Module (Enhanced)
  * Handles account switching logic including single/multi-account modes and fallback mechanisms
+ * Enhanced with load balancing integration and enhanced statistics
  */
 class AuthSwitcher {
-    constructor(logger, config, authSource, browserManager) {
+    constructor(logger, config, authSource, browserManager, loadBalancer = null) {
         this.logger = logger;
         this.config = config;
         this.authSource = authSource;
         this.browserManager = browserManager;
+        this.loadBalancer = loadBalancer; // Enhanced: integrate load balancer
+        
         this.failureCount = 0;
         this.usageCount = 0;
         this.isSystemBusy = false;
+        
+        // Enhanced tracking
+        this.switchHistory = [];
+        this.lastSwitchReason = null;
     }
 
     get currentAuthIndex() {
@@ -28,28 +35,7 @@ class AuthSwitcher {
         this.browserManager.currentAuthIndex = value;
     }
 
-    // getNextAuthIndex() {
-    //     const available = this.authSource.getRotationIndices();
-    //     if (available.length === 0) return null;
-
-    //     const currentCanonicalIndex =
-    //         this.currentAuthIndex >= 0
-    //             ? this.authSource.getCanonicalIndex(this.currentAuthIndex)
-    //             : this.currentAuthIndex;
-    //     const currentIndexInArray = available.indexOf(currentCanonicalIndex);
-
-    //     if (currentIndexInArray === -1) {
-    //         this.logger.warn(
-    //             `[Auth] Current index ${this.currentAuthIndex} not in available list, switching to first available index.`
-    //         );
-    //         return available[0];
-    //     }
-
-    //     const nextIndexInArray = (currentIndexInArray + 1) % available.length;
-    //     return available[nextIndexInArray];
-    // }
-
-    async switchToNextAuth() {
+    async switchToNextAuth(reason = 'unspecified') {
         const available = this.authSource.getRotationIndices();
 
         if (available.length === 0) {
@@ -62,6 +48,15 @@ class AuthSwitcher {
         }
 
         this.isSystemBusy = true;
+        this.lastSwitchReason = reason;
+        
+        // Enhanced: Notify load balancer about switching
+        if (this.loadBalancer) {
+            this.loadBalancer.updateAccountStats(this.currentAuthIndex, false, 0, { 
+                reason: 'switching',
+                timestamp: Date.now()
+            });
+        }
 
         try {
             // Single account mode
@@ -84,9 +79,17 @@ class AuthSwitcher {
                     this.logger.info(
                         `✅ [Auth] Single account #${singleIndex} restart/refresh successful, usage count reset.`
                     );
+                    
+                    // Record switch
+                    this.recordSwitchToHistory(this.currentAuthIndex, singleIndex, reason, true);
+                    
                     return { newIndex: singleIndex, success: true };
                 } catch (error) {
                     this.logger.error(`❌ [Auth] Single account restart failed: ${error.message}`);
+                    
+                    // Record switch failure
+                    this.recordSwitchToHistory(this.currentAuthIndex, singleIndex, reason, false, error);
+                    
                     throw new Error(`Only one account is available and restart failed: ${error.message}`);
                 }
             }
@@ -115,8 +118,6 @@ class AuthSwitcher {
             this.logger.info("==================================================");
 
             const failedAccounts = [];
-            // If no current account (currentAuthIndex=-1), start from i=0 to try all accounts
-            // If has current account, start from i=1 to skip current and try others
             const startOffset = hasCurrentAccount ? 1 : 0;
             const tryCount = hasCurrentAccount ? available.length - 1 : available.length;
 
@@ -130,7 +131,6 @@ class AuthSwitcher {
                 );
 
                 try {
-                    // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
                     await this.browserManager.preCleanupForSwitch(accountIndex);
                     await this.browserManager.switchAccount(accountIndex);
                     this.resetCounters();
@@ -148,6 +148,9 @@ class AuthSwitcher {
                         );
                     }
 
+                    // Record successful switch
+                    this.recordSwitchToHistory(this.currentAuthIndex, accountIndex, reason, true);
+                    
                     return { failedAccounts, newIndex: accountIndex, success: true };
                 } catch (error) {
                     this.logger.error(`❌ [Auth] Account #${accountIndex} failed: ${error.message}`);
@@ -156,7 +159,6 @@ class AuthSwitcher {
             }
 
             // If we had a current account, try it as a final fallback
-            // If we had no current account, we already tried all accounts, so skip fallback
             if (hasCurrentAccount && originalStartAccount !== null) {
                 this.logger.warn("==================================================");
                 this.logger.warn(
@@ -165,7 +167,6 @@ class AuthSwitcher {
                 this.logger.warn("==================================================");
 
                 try {
-                    // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
                     await this.browserManager.preCleanupForSwitch(originalStartAccount);
                     await this.browserManager.switchAccount(originalStartAccount);
                     this.resetCounters();
@@ -175,6 +176,10 @@ class AuthSwitcher {
                     this.logger.info(
                         `✅ [Auth] Final attempt succeeded! Switched to account #${originalStartAccount}.`
                     );
+                    
+                    // Record final attempt
+                    this.recordSwitchToHistory(this.currentAuthIndex, originalStartAccount, 'final_fallback', true);
+                    
                     return {
                         failedAccounts,
                         finalAttempt: true,
@@ -185,6 +190,10 @@ class AuthSwitcher {
                     this.logger.error(
                         `FATAL: ❌❌❌ [Auth] Final attempt with account #${originalStartAccount} also failed!`
                     );
+                    
+                    // Record final failure
+                    this.recordSwitchToHistory(this.currentAuthIndex, originalStartAccount, 'final_fallback', false, finalError);
+                    
                     failedAccounts.push(originalStartAccount);
 
                     // Throw fallback failure error with detailed information
@@ -200,6 +209,10 @@ class AuthSwitcher {
                 `FATAL: All ${available.length} accounts failed! Failed accounts: [${failedAccounts.join(", ")}]`
             );
             this.currentAuthIndex = -1;
+            
+            // Record comprehensive failure
+            this.recordSwitchToHistory(this.currentAuthIndex, -1, 'all_accounts_failed', false);
+            
             throw new Error(
                 `Switching to account failed: All ${available.length} available accounts failed to initialize. Failed accounts: [${failedAccounts.join(", ")}]`
             );
@@ -214,8 +227,6 @@ class AuthSwitcher {
             return { reason: "Switch already in progress.", success: false };
         }
 
-        // For manual switch, respect user's choice - don't auto-redirect to canonical index
-        // UI already shows duplicate indicator, so user is making a deliberate choice
         if (!this.authSource.availableIndices.includes(targetIndex)) {
             return {
                 reason: `Switch failed: Account #${targetIndex} invalid or does not exist.`,
@@ -224,9 +235,10 @@ class AuthSwitcher {
         }
 
         this.isSystemBusy = true;
+        this.lastSwitchReason = 'manual_switch';
+        
         try {
             this.logger.info(`🔄 [Auth] Starting switch to specified account #${targetIndex}...`);
-            // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
             await this.browserManager.preCleanupForSwitch(targetIndex);
             await this.browserManager.switchAccount(targetIndex);
             this.resetCounters();
@@ -234,9 +246,17 @@ class AuthSwitcher {
                 this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
             });
             this.logger.info(`✅ [Auth] Successfully switched to account #${targetIndex}, counters reset.`);
+            
+            // Record switch
+            this.recordSwitchToHistory(this.currentAuthIndex, targetIndex, 'manual', true);
+            
             return { newIndex: targetIndex, success: true };
         } catch (error) {
             this.logger.error(`❌ [Auth] Switch to specified account #${targetIndex} failed: ${error.message}`);
+            
+            // Record failure
+            this.recordSwitchToHistory(this.currentAuthIndex, targetIndex, 'manual', false, error);
+            
             throw error;
         } finally {
             this.isSystemBusy = false;
@@ -245,15 +265,19 @@ class AuthSwitcher {
 
     async handleRequestFailureAndSwitch(errorDetails, sendErrorCallback) {
         this.failureCount++;
-        if (this.config.failureThreshold > 0) {
-            this.logger.warn(
-                `⚠️ [Auth] Request failed - failure count: ${this.failureCount}/${this.config.failureThreshold} (Current account index: ${this.currentAuthIndex})`
-            );
-        } else {
-            this.logger.warn(
-                `⚠️ [Auth] Request failed - failure count: ${this.failureCount} (Current account index: ${this.currentAuthIndex})`
-            );
+        
+        // Enhanced: Update load balancer with failure
+        if (this.loadBalancer) {
+            this.loadBalancer.updateAccountStats(this.currentAuthIndex, false, 0, {
+                reason: 'request_failure',
+                error: errorDetails.message,
+                status: errorDetails.status
+            });
         }
+        
+        this.logger.warn(
+            `⚠️ [Auth] Request failed - failure count: ${this.failureCount} (Current account index: ${this.currentAuthIndex})`
+        );
 
         const isImmediateSwitch = this.config.immediateSwitchStatusCodes.includes(errorDetails.status);
         const isThresholdReached =
@@ -271,7 +295,7 @@ class AuthSwitcher {
             }
 
             try {
-                const result = await this.switchToNextAuth();
+                const result = await this.switchToNextAuth(isImmediateSwitch ? 'immediate_switch' : 'threshold_reached');
                 if (!result.success) {
                     this.logger.warn(`⚠️ [Auth] Account switch skipped: ${result.reason}`);
                     if (sendErrorCallback) {
@@ -303,6 +327,15 @@ class AuthSwitcher {
 
     incrementUsageCount() {
         this.usageCount++;
+        
+        // Enhanced: Update load balancer with usage
+        if (this.loadBalancer) {
+            this.loadBalancer.updateAccountStats(this.currentAuthIndex, true, 0, {
+                reason: 'usage_increment',
+                usageCount: this.usageCount
+            });
+        }
+        
         return this.usageCount;
     }
 
@@ -313,6 +346,165 @@ class AuthSwitcher {
     resetCounters() {
         this.failureCount = 0;
         this.usageCount = 0;
+    }
+
+    /**
+     * Enhanced: Get switch history
+     */
+    getSwitchHistory() {
+        return {
+            history: this.switchHistory,
+            lastReason: this.lastSwitchReason,
+            totalSwitches: this.switchHistory.length,
+            currentIndex: this.currentAuthIndex
+        };
+    }
+
+    /**
+     * Enhanced: Get current account stats
+     */
+    getCurrentAccountStats() {
+        if (!this.loadBalancer) {
+            return null;
+        }
+
+        const currentIndex = this.currentAuthIndex;
+        if (currentIndex < 0) {
+            return null;
+        }
+
+        return this.loadBalancer.getAccountStats(currentIndex);
+    }
+
+    /**
+     * Enhanced: Health check for current account
+     */
+    async healthCheckCurrentAccount() {
+        const stats = this.getCurrentAccountStats();
+        
+        if (!stats) {
+            return { healthy: false, reason: 'no_stats_available' };
+        }
+
+        // Check if account is healthy based on stats
+        const isHealthy = stats.isHealthy && 
+                         stats.consecutiveFailures === 0 &&
+                         stats.avgResponseTime < 5000; // 5 second threshold
+
+        if (!isHealthy) {
+            this.logger.warn(`[AuthSwitcher] Account #${this.currentAuthIndex} health check failed`);
+        }
+
+        return {
+            healthy: isHealthy,
+            stats: {
+                ...stats,
+                successRate: stats.totalRequests > 0 ? 
+                    (stats.successfulRequests / stats.totalRequests * 100).toFixed(2) : 0
+            }
+        };
+    }
+
+    /**
+     * Enhanced: Record switch to history
+     */
+    recordSwitchToHistory(fromIndex, toIndex, reason, success, error = null) {
+        const switchRecord = {
+            timestamp: new Date().toISOString(),
+            fromIndex,
+            toIndex,
+            reason,
+            success,
+            error: error ? error.message : null,
+            stats: this.getCurrentAccountStats()
+        };
+
+        this.switchHistory.push(switchRecord);
+
+        // Keep only last 100 records
+        if (this.switchHistory.length > 100) {
+            this.switchHistory = this.switchHistory.slice(-100);
+        }
+
+        // Emit event
+        this.emit('switchRecorded', switchRecord);
+    }
+
+    /**
+     * Enhanced: Get recommended switch based on load balancer
+     */
+    getRecommendedSwitch() {
+        if (!this.loadBalancer) {
+            return null;
+        }
+
+        const healthyAccounts = this.loadBalancer.getHealthyAccounts();
+        
+        if (healthyAccounts.length === 0) {
+            return null;
+        }
+
+        // Get best account based on load balancer
+        const bestAccount = this.loadBalancer.selectBestAccount();
+        
+        if (bestAccount === this.currentAuthIndex) {
+            // Current account is already the best
+            return {
+                shouldSwitch: false,
+                reason: 'current_account_is_best',
+                currentIndex: this.currentAuthIndex
+            };
+        }
+
+        return {
+            shouldSwitch: true,
+            reason: 'load_balancer_recommendation',
+            currentIndex: this.currentAuthIndex,
+            recommendedIndex: bestAccount,
+            stats: {
+                current: this.loadBalancer.getAccountStats(this.currentAuthIndex),
+                recommended: this.loadBalancer.getAccountStats(bestAccount)
+            }
+        };
+    }
+
+    /**
+     * Enhanced: Force switch to best account based on load balancer
+     */
+    async switchToBestAccount() {
+        const recommendation = this.getRecommendedSwitch();
+        
+        if (!recommendation || !recommendation.shouldSwitch) {
+            return {
+                success: false,
+                reason: recommendation ? recommendation.reason : 'no_recommendation'
+            };
+        }
+
+        try {
+            const result = await this.switchToSpecificAuth(recommendation.recommendedIndex);
+            
+            this.recordSwitchToHistory(
+                recommendation.currentIndex,
+                recommendation.recommendedIndex,
+                'load_balancer_optimization',
+                result.success
+            );
+
+            return result;
+        } catch (error) {
+            this.logger.error(`[AuthSwitcher] Failed to switch to best account: ${error.message}`);
+            
+            this.recordSwitchToHistory(
+                recommendation.currentIndex,
+                recommendation.recommendedIndex,
+                'load_balancer_optimization',
+                false,
+                error
+            );
+
+            throw error;
+        }
     }
 }
 

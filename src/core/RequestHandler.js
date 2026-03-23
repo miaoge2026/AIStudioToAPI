@@ -1,16 +1,19 @@
 /**
  * File: src/core/RequestHandler.js
- * Description: Main request handler that processes API requests, manages retries, and coordinates between authentication and format conversion
+ * Description: Enhanced request handler with load balancing, caching, and model management
  *
- * Author: Ellinav, iBenzene, bbbugg
+ * Author: miaoge2026 (重构)
+ * Version: 2.0.0
  */
 
 /**
- * Request Handler Module (Refactored)
- * Main request handler that coordinates between other modules
+ * Request Handler Module (Enhanced)
+ * Main request handler that coordinates between load balancer, cache, model manager, and format converter
  */
-const AuthSwitcher = require("../auth/AuthSwitcher");
+const LoadBalancer = require("./LoadBalancer");
 const FormatConverter = require("./FormatConverter");
+const CacheManager = require("../utils/CacheManager");
+const ModelManager = require("../models/ModelManager");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
 
@@ -21,7 +24,8 @@ const TIMEOUTS = {
 };
 
 class RequestHandler {
-    constructor(serverSystem, connectionRegistry, logger, browserManager, config, authSource) {
+    constructor(serverSystem, connectionRegistry, logger, browserManager, config, authSource, 
+                loadBalancer, cacheManager, modelManager) {
         this.serverSystem = serverSystem;
         this.connectionRegistry = connectionRegistry;
         this.logger = logger;
@@ -29,16 +33,572 @@ class RequestHandler {
         this.config = config;
         this.authSource = authSource;
 
-        // Initialize sub-modules
-        this.authSwitcher = new AuthSwitcher(logger, config, authSource, browserManager);
+        // Use injected enhanced sub-modules or create new ones
+        this.loadBalancer = loadBalancer || new LoadBalancer(logger, config);
         this.formatConverter = new FormatConverter(logger, serverSystem);
+        this.cacheManager = cacheManager || new CacheManager(logger, config);
+        this.modelManager = modelManager || new ModelManager(logger, config);
+        
+        this.authSwitcher = new AuthSwitcher(logger, config, authSource, browserManager);
 
-        this.maxRetries = this.config.maxRetries;
-        this.retryDelay = this.config.retryDelay;
+        this.maxRetries = this.config.get('proxy.maxRetries') || 3;
+        this.retryDelay = this.config.get('proxy.retryDelay') || 1000;
         this.needsSwitchingAfterRequest = false;
 
-        // Timeout settings
-        this.timeouts = TIMEOUTS;
+        // Enhanced timeout settings
+        this.timeouts = {
+            ...TIMEOUTS,
+            ...config.get('timeouts') || {}
+        };
+        
+        // Initialize enhanced features
+        this.initializeEnhancedFeatures();
+    }
+
+    // Enhanced processing methods for different API formats
+
+    async processOpenAIRequestEnhanced(req, res) {
+        return this._processEnhancedRequest(req, res, 'openai');
+    }
+
+    async processClaudeRequestEnhanced(req, res) {
+        return this._processEnhancedRequest(req, res, 'claude');
+    }
+
+    async processGeminiRequestEnhanced(req, res) {
+        return this._processEnhancedRequest(req, res, 'gemini');
+    }
+
+    async processGeminiStreamRequestEnhanced(req, res) {
+        return this._processEnhancedRequest(req, res, 'gemini', { streaming: true });
+    }
+
+    async processGeminiCountTokensEnhanced(req, res) {
+        return this._processEnhancedRequest(req, res, 'gemini_count_tokens');
+    }
+
+    async processGeminiFileUploadEnhanced(req, res, options = {}) {
+        return this._processEnhancedRequest(req, res, 'gemini_upload', options);
+    }
+
+    async processOpenAIResponseInputTokensEnhanced(req, res) {
+        return this._processEnhancedRequest(req, res, 'openai_response_input_tokens');
+    }
+
+    async processClaudeCountTokensEnhanced(req, res) {
+        return this._processEnhancedRequest(req, res, 'claude_count_tokens');
+    }
+
+    /**
+     * Unified enhanced request processing method
+     */
+    async _processEnhancedRequest(req, res, format, options = {}) {
+        const requestId = this._generateRequestId();
+        const startTime = Date.now();
+        
+        try {
+            // 1. Parse and validate request based on format
+            const requestData = await this.parseAndValidateRequest(req, format);
+            if (!requestData.valid) {
+                return this.sendErrorResponse(res, 400, requestData.error, { format, requestId });
+            }
+            
+            // 2. Check cache for identical request
+            const cacheKey = this.generateRequestCacheKey(requestData, format);
+            const cachedResponse = this.cacheManager.get(cacheKey, 'responses');
+            
+            if (cachedResponse) {
+                this.logger.info(`[RequestHandler] Cache hit for ${format} request ${requestId}`);
+                this.updateRequestStats(true, Date.now() - startTime);
+                return this.sendCachedResponse(res, cachedResponse);
+            }
+            
+            // 3. Select best model based on requirements
+            const model = await this.selectBestModel(requestData, format);
+            if (!model) {
+                return this.sendErrorResponse(res, 400, 'No suitable model available', { format, requestId });
+            }
+            
+            // 4. Select best account using load balancer
+            const accountIndex = this.loadBalancer.selectBestAccount();
+            if (accountIndex === null) {
+                return this.sendErrorResponse(res, 503, 'No healthy accounts available', { format, requestId });
+            }
+            
+            // 5. Process request with selected model and account
+            const result = await this.processWithModelAndAccount(
+                requestData, model, accountIndex, requestId, format, options
+            );
+            
+            // 6. Cache successful response
+            if (result.success) {
+                const cacheTTL = this.getCacheTTL(format, options);
+                this.cacheManager.set(cacheKey, result.response, cacheTTL, 'responses');
+            }
+            
+            // 7. Update statistics
+            this.updateRequestStats(result.success, Date.now() - startTime);
+            this.updateModelStats(model.name, result);
+            this.loadBalancer.updateAccountStats(
+                accountIndex, 
+                result.success, 
+                Date.now() - startTime,
+                { model: model.name, format }
+            );
+            
+            // 8. Send enhanced response
+            return this.sendEnhancedResponse(res, result, format, options);
+            
+        } catch (error) {
+            this.logger.error(`[RequestHandler] Enhanced ${format} request processing failed: ${error.message}`);
+            this.updateRequestStats(false, Date.now() - startTime);
+            return this.sendErrorResponse(res, 500, 'Internal server error', { format, requestId });
+        } finally {
+            this.connectionRegistry.removeMessageQueue(requestId, 'request_complete');
+        }
+    }
+
+    /**
+     * Initialize enhanced features like caching, load balancing, and model management
+     */
+    initializeEnhancedFeatures() {
+        // Setup cache for common operations
+        this.setupCaching();
+        
+        // Setup load balancing events
+        this.setupLoadBalancerEvents();
+        
+        // Setup model manager events
+        this.setupModelManagerEvents();
+        
+        // Setup performance monitoring
+        this.setupPerformanceMonitoring();
+        
+        this.logger.info('[RequestHandler] Enhanced features initialized');
+    }
+
+    /**
+     * Setup caching for requests and responses
+     */
+    setupCaching() {
+        // Cache common model configurations
+        this.cacheManager.createCache('models', {
+            ttl: 300, // 5 minutes
+            maxSize: 100
+        });
+        
+        // Cache API responses
+        this.cacheManager.createCache('responses', {
+            ttl: 60, // 1 minute
+            maxSize: 1000
+        });
+        
+        this.logger.info('[RequestHandler] Caching system initialized');
+    }
+
+    /**
+     * Setup load balancer event handlers
+     */
+    setupLoadBalancerEvents() {
+        this.loadBalancer.on('accountUnhealthy', (accountIndex) => {
+            this.logger.warn(`[RequestHandler] Account #${accountIndex} marked as unhealthy by load balancer`);
+            this.handleAccountHealthChange(accountIndex, false);
+        });
+        
+        this.loadBalancer.on('statsUpdated', (stats) => {
+            this.emit('loadBalancerStats', stats);
+        });
+        
+        this.logger.info('[RequestHandler] Load balancer events configured');
+    }
+
+    /**
+     * Setup model manager event handlers
+     */
+    setupModelManagerEvents() {
+        this.modelManager.on('modelStatsUpdated', (modelName, stats) => {
+            this.emit('modelStatsUpdated', modelName, stats);
+        });
+        
+        this.logger.info('[RequestHandler] Model manager events configured');
+    }
+
+    /**
+     * Setup performance monitoring
+     */
+    setupPerformanceMonitoring() {
+        // Monitor request processing time
+        this.requestStats = {
+            totalRequests: 0,
+            successfulRequests: 0,
+            failedRequests: 0,
+            totalProcessingTime: 0,
+            avgProcessingTime: 0
+        };
+        
+        // Monitor cache performance
+        this.cacheManager.on('cacheExpired', (data) => {
+            this.logger.debug(`[RequestHandler] Cache expired: ${data.key}`);
+        });
+        
+        this.logger.info('[RequestHandler] Performance monitoring initialized');
+    }
+
+    /**
+     * Enhanced request processing with load balancing and caching
+     */
+    async processRequestEnhanced(req, res) {
+        const requestId = this._generateRequestId();
+        const startTime = Date.now();
+        
+        try {
+            // 1. Parse and validate request
+            const requestData = await this.parseAndValidateRequest(req);
+            if (!requestData.valid) {
+                return this.sendErrorResponse(res, 400, requestData.error);
+            }
+            
+            // 2. Check cache for identical request
+            const cacheKey = this.generateRequestCacheKey(requestData);
+            const cachedResponse = this.cacheManager.get(cacheKey, 'responses');
+            
+            if (cachedResponse) {
+                this.logger.info(`[RequestHandler] Cache hit for request ${requestId}`);
+                this.updateRequestStats(true, Date.now() - startTime);
+                return this.sendCachedResponse(res, cachedResponse);
+            }
+            
+            // 3. Select best model based on requirements
+            const model = await this.selectBestModel(requestData);
+            if (!model) {
+                return this.sendErrorResponse(res, 400, 'No suitable model available');
+            }
+            
+            // 4. Select best account using load balancer
+            const accountIndex = this.loadBalancer.selectBestAccount();
+            if (accountIndex === null) {
+                return this.sendErrorResponse(res, 503, 'No healthy accounts available');
+            }
+            
+            // 5. Process request with selected model and account
+            const result = await this.processWithModelAndAccount(
+                requestData, model, accountIndex, requestId
+            );
+            
+            // 6. Cache successful response
+            if (result.success) {
+                this.cacheManager.set(cacheKey, result.response, 60, 'responses');
+            }
+            
+            // 7. Update statistics
+            this.updateRequestStats(result.success, Date.now() - startTime);
+            this.updateModelStats(model.name, result);
+            this.loadBalancer.updateAccountStats(
+                accountIndex, 
+                result.success, 
+                Date.now() - startTime
+            );
+            
+            // 8. Send response
+            return this.sendEnhancedResponse(res, result);
+            
+        } catch (error) {
+            this.logger.error(`[RequestHandler] Enhanced request processing failed: ${error.message}`);
+            this.updateRequestStats(false, Date.now() - startTime);
+            return this.sendErrorResponse(res, 500, 'Internal server error');
+        } finally {
+            this.connectionRegistry.removeMessageQueue(requestId, 'request_complete');
+        }
+    }
+
+    /**
+     * Parse and validate incoming request
+     */
+    async parseAndValidateRequest(req) {
+        try {
+            const body = req.body;
+            
+            // Determine request type and validate accordingly
+            if (req.path.includes('/v1/chat/completions')) {
+                return this.validateOpenAIRequest(body);
+            } else if (req.path.includes('/v1/messages')) {
+                return this.validateClaudeRequest(body);
+            } else if (req.path.includes('/v1beta/models')) {
+                return this.validateGeminiRequest(body);
+            }
+            
+            return { valid: false, error: 'Unknown request type' };
+        } catch (error) {
+            return { valid: false, error: error.message };
+        }
+    }
+
+    /**
+     * Validate OpenAI format request
+     */
+    validateOpenAIRequest(body) {
+        if (!body.model || !body.messages) {
+            return { valid: false, error: 'Missing required fields: model, messages' };
+        }
+        
+        // Check cache for model info
+        const modelInfo = this.cacheManager.get(`model:${body.model}`, 'models');
+        if (!modelInfo) {
+            const model = this.modelManager.getModel(body.model);
+            if (!model) {
+                return { valid: false, error: `Unknown model: ${body.model}` };
+            }
+            this.cacheManager.set(`model:${body.model}`, model, 300, 'models');
+        }
+        
+        return {
+            valid: true,
+            type: 'openai',
+            model: body.model,
+            messages: body.messages,
+            stream: body.stream || false,
+            maxTokens: body.max_tokens,
+            temperature: body.temperature
+        };
+    }
+
+    /**
+     * Validate Claude format request
+     */
+    validateClaudeRequest(body) {
+        if (!body.model || !body.messages) {
+            return { valid: false, error: 'Missing required fields: model, messages' };
+        }
+        
+        return {
+            valid: true,
+            type: 'claude',
+            model: body.model,
+            messages: body.messages,
+            stream: body.stream || false,
+            maxTokens: body.max_tokens,
+            temperature: body.temperature
+        };
+    }
+
+    /**
+     * Validate Gemini format request
+     */
+    validateGeminiRequest(body) {
+        if (!body.contents) {
+            return { valid: false, error: 'Missing required field: contents' };
+        }
+        
+        return {
+            valid: true,
+            type: 'gemini',
+            contents: body.contents,
+            generationConfig: body.generationConfig,
+            stream: req.path.includes('stream')
+        };
+    }
+
+    /**
+     * Select best model based on request requirements
+     */
+    async selectBestModel(requestData) {
+        const requirements = this.extractModelRequirements(requestData);
+        const recommendations = this.modelManager.getModelRecommendations(requirements);
+        
+        if (recommendations.length === 0) {
+            this.logger.warn('[RequestHandler] No suitable model found for requirements');
+            return null;
+        }
+        
+        // Return highest priority enabled model
+        return recommendations[0];
+    }
+
+    /**
+     * Extract model requirements from request
+     */
+    extractModelRequirements(requestData) {
+        return {
+            capabilities: this.extractRequiredCapabilities(requestData),
+            maxTokens: requestData.maxTokens || 1000,
+            budget: this.calculateBudget(requestData)
+        };
+    }
+
+    /**
+     * Extract required capabilities from request
+     */
+    extractRequiredCapabilities(requestData) {
+        const capabilities = ['text']; // Always need text
+        
+        // Check for image content
+        if (this.hasImageContent(requestData)) {
+            capabilities.push('image');
+        }
+        
+        // Check for code content
+        if (this.hasCodeContent(requestData)) {
+            capabilities.push('code');
+        }
+        
+        return capabilities;
+    }
+
+    /**
+     * Check if request has image content
+     */
+    hasImageContent(requestData) {
+        if (requestData.type === 'openai') {
+            return requestData.messages.some(msg => 
+                msg.content && Array.isArray(msg.content) && 
+                msg.content.some(part => part.type === 'image_url')
+            );
+        }
+        return false;
+    }
+
+    /**
+     * Check if request has code content
+     */
+    hasCodeContent(requestData) {
+        if (requestData.type === 'openai') {
+            return requestData.messages.some(msg => 
+                msg.content && typeof msg.content === 'string' &&
+                (msg.content.includes('```') || msg.content.includes('function'))
+            );
+        }
+        return false;
+    }
+
+    /**
+     * Calculate budget for request
+     */
+    calculateBudget(requestData) {
+        // Simple budget calculation based on max tokens
+        const maxTokens = requestData.maxTokens || 1000;
+        return (maxTokens / 1000) * 0.01; // $0.01 per 1K tokens as default
+    }
+
+    /**
+     * Generate cache key for request
+     */
+    generateRequestCacheKey(requestData) {
+        const keyData = {
+            type: requestData.type,
+            model: requestData.model,
+            messages: JSON.stringify(requestData.messages || requestData.contents || []),
+            maxTokens: requestData.maxTokens,
+            temperature: requestData.temperature
+        };
+        
+        return `request:${JSON.stringify(keyData)}`;
+    }
+
+    /**
+     * Send cached response
+     */
+    sendCachedResponse(res, cachedResponse) {
+        res.setHeader('X-Cache-Hit', 'true');
+        res.setHeader('Content-Type', 'application/json');
+        res.status(200).send(JSON.stringify(cachedResponse));
+    }
+
+    /**
+     * Send enhanced response with additional headers
+     */
+    sendEnhancedResponse(res, result) {
+        if (result.cached) {
+            res.setHeader('X-Cache-Hit', 'true');
+        }
+        
+        res.setHeader('X-Model-Used', result.model);
+        res.setHeader('X-Account-Index', result.accountIndex);
+        res.setHeader('X-Response-Time', result.responseTime);
+        
+        if (result.usage) {
+            res.setHeader('X-Usage-Tokens', result.usage.totalTokens);
+            res.setHeader('X-Usage-Cost', result.usage.totalCost);
+        }
+        
+        res.setHeader('Content-Type', 'application/json');
+        res.status(result.status || 200).send(JSON.stringify(result.response));
+    }
+
+    /**
+     * Send error response with enhanced error handling
+     */
+    sendErrorResponse(res, status, message, details = {}) {
+        res.setHeader('X-Error-Type', details.type || 'api_error');
+        res.setHeader('X-Error-Timestamp', new Date().toISOString());
+        
+        if (details.model) {
+            res.setHeader('X-Error-Model', details.model);
+        }
+        
+        res.status(status).json({
+            error: {
+                code: status,
+                message: message,
+                type: details.type || 'api_error',
+                details: details
+            }
+        });
+    }
+
+    /**
+     * Update request statistics
+     */
+    updateRequestStats(success, processingTime) {
+        this.requestStats.totalRequests++;
+        this.requestStats.totalProcessingTime += processingTime;
+        this.requestStats.avgProcessingTime = 
+            this.requestStats.totalProcessingTime / this.requestStats.totalRequests;
+        
+        if (success) {
+            this.requestStats.successfulRequests++;
+        } else {
+            this.requestStats.failedRequests++;
+        }
+        
+        // Emit stats update event
+        this.emit('requestStatsUpdated', { ...this.requestStats });
+    }
+
+    /**
+     * Update model statistics
+     */
+    updateModelStats(modelName, result) {
+        const stats = {
+            success: result.success,
+            responseTime: result.responseTime,
+            tokens: result.usage?.totalTokens,
+            cost: result.usage?.totalCost
+        };
+        
+        this.modelManager.updateModelStats(modelName, stats);
+    }
+
+    /**
+     * Handle account health change
+     */
+    handleAccountHealthChange(accountIndex, isHealthy) {
+        if (isHealthy) {
+            this.loadBalancer.resetAccount(accountIndex);
+        }
+        
+        this.emit('accountHealthChanged', accountIndex, isHealthy);
+    }
+
+    /**
+     * Get enhanced statistics
+     */
+    getEnhancedStats() {
+        return {
+            requests: this.requestStats,
+            models: this.modelManager.getAllModelStats(),
+            loadBalancer: this.loadBalancer.getAllAccountStats(),
+            cache: this.cacheManager.getAllStats()
+        };
     }
 
     // Delegate properties to AuthSwitcher
